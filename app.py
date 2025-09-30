@@ -74,7 +74,7 @@ RETAILERS = {
         "search": lambda q: f"https://www.homedepot.com/s/{quote_plus(q)}?searchTerm={quote_plus(q)}",
         "pdp_link_pat": re.compile(r'href="(/p/[^"]+)"|href="(https?://www\.homedepot\.com/p/[^"]+)"', re.I),
         "title_clean": lambda t: re.sub(r"\s*-?\s*The Home Depot.*$", "", t, flags=re.I),
-        "append_ncni": True,  # add ?NCNI-5 to reduce interstitials
+        "append_ncni": True,
     },
     "Lowes": {
         "base": "https://www.lowes.com",
@@ -210,17 +210,145 @@ def maybe_append_ncni(url: str, retailer: str):
 def check_identifier(q: str, retailer: str, timeout: int = 20, max_candidates: int = 5):
     s = make_session()
     try:
-        # 1) Search page
         url_search = RETAILERS[retailer]["search"](q)
         r = s.get(url_search, timeout=timeout)
         search_html = r.text
 
-        # 2) Try candidate PDP links
         candidates = find_pdp_links(search_html, retailer, max_candidates)
         if not candidates:
             return {
                 "Query": q, "Site": retailer,
                 "Status": classify_html_with_fallbacks(search_html),
                 "Product Name": clean_title(search_html, retailer),
-                "URL": r.u
+                "URL": r.url, "HTTP": r.status_code,
+                "Notes": "No PDP link found on search page",
+            }
 
+        first_resp = None
+        for idx, pdp in enumerate(candidates, start=1):
+            pdp_url = maybe_append_ncni(pdp, retailer)
+            r2 = s.get(pdp_url, timeout=timeout)
+            if first_resp is None:
+                first_resp = (r2.url, r2.status_code, r2.text)
+            status = classify_html_with_fallbacks(r2.text)
+            if status in ("Live / Available", "Found but Not Available"):
+                return {
+                    "Query": q, "Site": retailer, "Status": status,
+                    "Product Name": clean_title(r2.text, retailer),
+                    "URL": r2.url, "HTTP": r2.status_code,
+                    "Notes": f"Candidate {idx}/{len(candidates)}",
+                }
+
+        if first_resp:
+            u, c, h = first_resp
+            return {
+                "Query": q, "Site": retailer,
+                "Status": classify_html_with_fallbacks(h),
+                "Product Name": clean_title(h, retailer),
+                "URL": u, "HTTP": c,
+                "Notes": "No definitive candidate; used first PDP",
+            }
+
+        return {
+            "Query": q, "Site": retailer,
+            "Status": classify_html_with_fallbacks(search_html),
+            "Product Name": clean_title(search_html, retailer),
+            "URL": r.url, "HTTP": r.status_code,
+            "Notes": "No PDP candidates after parsing",
+        }
+
+    except Exception as e:
+        return {
+            "Query": q, "Site": retailer,
+            "Status": "Error",
+            "Product Name": None,
+            "URL": None,
+            "HTTP": 0,
+            "Notes": str(e),
+        }
+
+# =========================
+# File Upload (robust)
+# =========================
+with st.sidebar:
+    max_candidates = st.slider("PDP candidates to try", 1, 8, 5)
+    st.caption("If search shows category tiles first, trying more candidates helps.")
+    st.markdown("---")
+
+uploaded = st.file_uploader(
+    "Upload CSV/XLSX of SKUs (first column used)",
+    type=["csv", "xlsx", "xls"]
+)
+use_example = st.toggle("Use example SKUs (EZC17, EZC21, EZD17, EZD21, EZL17, EZL21)")
+
+if not uploaded and not use_example:
+    st.info("Upload a file or toggle the example to proceed.")
+    st.stop()
+
+try:
+    if uploaded:
+        fname = uploaded.name.lower()
+        if fname.endswith(".csv"):
+            df_in = pd.read_csv(uploaded)
+        elif fname.endswith(".xlsx"):
+            try:
+                df_in = pd.read_excel(uploaded, engine="openpyxl")
+            except ImportError:
+                st.error("Excel support requires `openpyxl`. Add it to requirements.txt and redeploy.")
+                st.stop()
+        elif fname.endswith(".xls"):
+            st.error("Legacy .xls files aren’t supported. Save as .xlsx or CSV instead.")
+            st.stop()
+        else:
+            st.error("Unsupported file type. Please upload CSV or XLSX.")
+            st.stop()
+    else:
+        df_in = pd.DataFrame({"SKU": ["EZC17","EZC21","EZD17","EZD21","EZL17","EZL21"]})
+except Exception as e:
+    st.error(f"Failed to read file: {e}")
+    st.stop()
+
+first_col = df_in.columns[0]
+skus = (
+    df_in[first_col]
+    .astype(str)
+    .str.strip()
+    .replace("", pd.NA)
+    .dropna()
+    .tolist()
+)
+
+# =========================
+# UI per retailer + Export
+# =========================
+def to_excel_bytes(df: pd.DataFrame) -> bytes:
+    from io import BytesIO
+    bio = BytesIO()
+    with pd.ExcelWriter(bio, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="Results")
+    return bio.getvalue()
+
+tabs = st.tabs(["HomeDepot.com", "Lowes.com", "TractorSupply.com"])
+for retailer, tab in zip(["HomeDepot", "Lowes", "TractorSupply"], tabs):
+    with tab:
+        st.caption("Search → try first few PDP links → classify availability on PDP via JSON-LD/microdata (fallback: text).")
+        run = st.button(f"🔎 Check on {retailer}", key=f"btn_{retailer}")
+        if run:
+            rows = []
+            prog = st.progress(0)
+            for i, sku in enumerate(skus, start=1):
+                rows.append(check_identifier(sku, retailer, max_candidates=max_candidates))
+                prog.progress(i / max(1, len(skus)))
+                st.dataframe(pd.DataFrame(rows), use_container_width=True)
+            out = pd.DataFrame(rows)
+            st.dataframe(out, use_container_width=True)
+
+            xls = to_excel_bytes(out)
+            st.download_button(
+                "📥 Download Excel Results",
+                data=xls,
+                file_name=f"{retailer.lower()}_sku_status.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+
+st.caption("Tip: If you see false 'No Results', increase 'PDP candidates to try' in the sidebar.")
