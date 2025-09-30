@@ -85,4 +85,142 @@ RETAILERS = {
     },
     "TractorSupply": {
         "base": "https://www.tractorsupply.com",
-        "search": lambda q: f"https://www.tractorsupply.com/tsc/searc
+        "search": lambda q: f"https://www.tractorsupply.com/tsc/search/{quote_plus(q)}",
+        "pdp_link_pat": re.compile(r'href="(/tsc/product/[^"]+)"|href="(https?://www\.tractorsupply\.com/tsc/product/[^"]+)"', re.I),
+        "title_clean": lambda t: re.sub(r"\s*at\s*Tractor Supply.*$", "", t, flags=re.I),
+        "append_ncni": False,
+    },
+}
+
+# =========================
+# JSON-LD & Microdata Parsing
+# =========================
+AVAIL_MAP = {
+    "instock": "Live / Available",
+    "outofstock": "Found but Not Available",
+    "discontinued": "Found but Not Available",
+    "http://schema.org/instock": "Live / Available",
+    "https://schema.org/instock": "Live / Available",
+    "http://schema.org/outofstock": "Found but Not Available",
+    "https://schema.org/outofstock": "Found but Not Available",
+    "http://schema.org/discontinued": "Found but Not Available",
+    "https://schema.org/discontinued": "Found but Not Available",
+}
+
+LD_JSON_PAT = re.compile(r'<script[^>]+type="application/ld\+json"[^>]*>(.*?)</script>', re.S | re.I)
+MICRODATA_AVAIL_PAT = re.compile(r'itemprop=["\']availability["\'][^>]*href=["\']([^"\']+)["\']', re.I)
+PRICE_PAT = re.compile(r'"price"\s*:\s*"?\$?(\d[\d\.,]*)', re.I)
+
+def _normalize_availability(v: str | None):
+    if not v:
+        return None
+    v = v.strip().lower().replace("http://schema.org/", "").replace("https://schema.org/", "")
+    return AVAIL_MAP.get(v)
+
+def _walk_offers(obj):
+    if isinstance(obj, dict):
+        if "offers" in obj:
+            yield obj["offers"]
+        for key in ("aggregateOffer", "aggregateOffers"):
+            if key in obj:
+                yield obj[key]
+        for v in obj.values():
+            yield from _walk_offers(v)
+    elif isinstance(obj, list):
+        for it in obj:
+            yield from _walk_offers(it)
+
+def classify_via_jsonld(html: str):
+    for m in LD_JSON_PAT.finditer(html):
+        raw = unescape(m.group(1)).strip()
+        try:
+            data = json.loads(raw)
+        except Exception:
+            continue
+        for offers in _walk_offers(data):
+            if isinstance(offers, list):
+                for off in offers:
+                    status = _normalize_availability(str(off.get("availability", "")))
+                    if status:
+                        return status
+            elif isinstance(offers, dict):
+                status = _normalize_availability(str(offers.get("availability", "")))
+                if status:
+                    return status
+    return None
+
+def classify_via_microdata(html: str):
+    m = MICRODATA_AVAIL_PAT.search(html)
+    if not m:
+        return None
+    return _normalize_availability(m.group(1))
+
+def classify_html_with_fallbacks(html: str):
+    via_ld = classify_via_jsonld(html)
+    if via_ld:
+        return via_ld
+    via_micro = classify_via_microdata(html)
+    if via_micro:
+        return via_micro
+    if PRICE_PAT.search(html):
+        for rx in AVAIL_NOT:
+            if rx.search(html):
+                return "Found but Not Available"
+        return "Live / Available"
+    for rx in AVAIL_LIVE:
+        if rx.search(html):
+            return "Live / Available"
+    for rx in AVAIL_NOT:
+        if rx.search(html):
+            return "Found but Not Available"
+    return "No Results"
+
+def clean_title(html: str, retailer: str):
+    m = TITLE_PAT.search(html)
+    if not m:
+        return None
+    raw = re.sub(r"\s+", " ", m.group(1)).strip()
+    return RETAILERS[retailer]["title_clean"](raw)
+
+# =========================
+# PDP Links (multi-candidate)
+# =========================
+def find_pdp_links(search_html: str, retailer: str, max_links: int = 5):
+    pat = RETAILERS[retailer]["pdp_link_pat"]
+    base = RETAILERS[retailer]["base"]
+    seen = set()
+    out = []
+    for m in pat.finditer(search_html):
+        href = m.group(1) or m.group(2)
+        if not href:
+            continue
+        url = urljoin(base, href)
+        if url not in seen:
+            seen.add(url)
+            out.append(url)
+        if len(out) >= max_links:
+            break
+    return out
+
+def maybe_append_ncni(url: str, retailer: str):
+    if retailer == "HomeDepot" and RETAILERS[retailer].get("append_ncni", False) and "NCNI-5" not in url:
+        return f"{url}{'&' if '?' in url else '?'}NCNI-5"
+    return url
+
+def check_identifier(q: str, retailer: str, timeout: int = 20, max_candidates: int = 5):
+    s = make_session()
+    try:
+        # 1) Search page
+        url_search = RETAILERS[retailer]["search"](q)
+        r = s.get(url_search, timeout=timeout)
+        search_html = r.text
+
+        # 2) Try candidate PDP links
+        candidates = find_pdp_links(search_html, retailer, max_candidates)
+        if not candidates:
+            return {
+                "Query": q, "Site": retailer,
+                "Status": classify_html_with_fallbacks(search_html),
+                "Product Name": clean_title(search_html, retailer),
+                "URL": r.u
+
