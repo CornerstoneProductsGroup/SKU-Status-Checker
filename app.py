@@ -2,13 +2,15 @@ import streamlit as st
 import pandas as pd
 import requests
 import re
+import json
+from html import unescape
 from urllib.parse import quote_plus, urljoin
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 st.set_page_config(page_title="SKU Checker", page_icon="🛒", layout="wide")
-st.title("🛒 SKU Checker Across Retailers (Sync, PDP-accurate)")
-st.write("Upload a CSV/XLSX of SKUs. App searches each site, follows the first product result to its PDP, and classifies availability.")
+st.title("🛒 SKU Checker Across Retailers (Sync, PDP-accurate, Multi-candidate)")
+st.write("Search each site, try the first few product links, classify on the product page using JSON-LD/microdata (with text fallbacks).")
 
 # ---------- HTTP/session ----------
 HEADERS = {
@@ -56,76 +58,182 @@ RETAILERS = {
     "HomeDepot": {
         "base": "https://www.homedepot.com",
         "search": lambda q: f"https://www.homedepot.com/s/{quote_plus(q)}?searchTerm={quote_plus(q)}",
-        # Typical PDP anchors: /p/<slug>/<id> or full https link
         "pdp_link_pat": re.compile(r'href="(/p/[^"]+)"|href="(https?://www\.homedepot\.com/p/[^"]+)"', re.I),
         "title_clean": lambda t: re.sub(r"\s*-?\s*The Home Depot.*$", "", t, flags=re.I),
+        "append_ncni": True,
     },
     "Lowes": {
         "base": "https://www.lowes.com",
         "search": lambda q: f"https://www.lowes.com/search?searchTerm={quote_plus(q)}",
         "pdp_link_pat": re.compile(r'href="(/pd/[^"]+)"|href="(https?://www\.lowes\.com/pd/[^"]+)"', re.I),
         "title_clean": lambda t: re.sub(r"\s*at\s*Lowes\.com.*$", "", t, flags=re.I),
+        "append_ncni": False,
     },
     "TractorSupply": {
         "base": "https://www.tractorsupply.com",
         "search": lambda q: f"https://www.tractorsupply.com/tsc/search/{quote_plus(q)}",
         "pdp_link_pat": re.compile(r'href="(/tsc/product/[^"]+)"|href="(https?://www\.tractorsupply\.com/tsc/product/[^"]+)"', re.I),
         "title_clean": lambda t: re.sub(r"\s*at\s*Tractor Supply.*$", "", t, flags=re.I),
+        "append_ncni": False,
     },
 }
 
-def classify_html(html: str):
-    # Quick PDP classification using text cues
-    for rx in AVAIL_LIVE:
-        if rx.search(html):
-            return "Live / Available"
-    for rx in AVAIL_NOT:
-        if rx.search(html):
-            return "Found but Not Available"
-    return "No Results"
+# ---------- JSON-LD & microdata availability ----------
+AVAIL_MAP = {
+    "instock": "Live / Available",
+    "outofstock": "Found but Not Available",
+    "discontinued": "Found but Not Available",
+    "http://schema.org/instock": "Live / Available",
+    "https://schema.org/instock": "Live / Available",
+    "http://schema.org/outofstock": "Found but Not Available",
+    "https://schema.org/outofstock": "Found but Not Available",
+    "http://schema.org/discontinued": "Found but Not Available",
+    "https://schema.org/discontinued": "Found but Not Available",
+}
+LD_JSON_PAT = re.compile(r'<script[^>]+type="application/ld\+json"[^>]*>(.*?)</script>', re.S | re.I)
+MICRODATA_AVAIL_PAT = re.compile(r'itemprop=["\']availability["\'][^>]*href=["\']([^"\']+)["\']', re.I)
+PRICE_PAT = re.compile(r'"price"\s*:\s*"?\$?(\d[\d\.,]*)', re.I)
 
-def find_first_pdp(search_html: str, retailer: str):
-    pat = RETAILERS[retailer]["pdp_link_pat"]
-    base = RETAILERS[retailer]["base"]
-    m = pat.search(search_html)
-    if not m:
-        return None
-    href = m.group(1) or m.group(2)
-    return urljoin(base, href)
+def _normalize_availability(v: str | None):
+    if not v: return None
+    v = v.strip().lower().replace("http://schema.org/", "").replace("https://schema.org/", "")
+    return AVAIL_MAP.get(v)
+
+def _walk_offers(obj):
+    if isinstance(obj, dict):
+        if "offers" in obj: yield obj["offers"]
+        for key in ("aggregateOffer", "aggregateOffers"):  # sometimes named differently
+            if key in obj: yield obj[key]
+        for v in obj.values():
+            yield from _walk_offers(v)
+    elif isinstance(obj, list):
+        for it in obj:
+            yield from _walk_offers(it)
+
+def classify_via_jsonld(html: str):
+    for m in LD_JSON_PAT.finditer(html):
+        raw = unescape(m.group(1)).strip()
+        try:
+            data = json.loads(raw)
+        except Exception:
+            continue
+        for offers in _walk_offers(data):
+            if isinstance(offers, list):
+                for off in offers:
+                    status = _normalize_availability(str(off.get("availability", "")))
+                    if status: return status
+            elif isinstance(offers, dict):
+                status = _normalize_availability(str(offers.get("availability", "")))
+                if status: return status
+    return None
+
+def classify_via_microdata(html: str):
+    m = MICRODATA_AVAIL_PAT.search(html)
+    if not m: return None
+    return _normalize_availability(m.group(1))
+
+def classify_html_with_fallbacks(html: str):
+    via_ld = classify_via_jsonld(html)
+    if via_ld: return via_ld
+    via_micro = classify_via_microdata(html)
+    if via_micro: return via_micro
+    if PRICE_PAT.search(html):
+        for rx in AVAIL_NOT:
+            if rx.search(html):  # explicit OOS wins
+                return "Found but Not Available"
+        return "Live / Available"
+    for rx in AVAIL_LIVE:
+        if rx.search(html): return "Live / Available"
+    for rx in AVAIL_NOT:
+        if rx.search(html): return "Found but Not Available"
+    return "No Results"
 
 def clean_title(html: str, retailer: str):
     m = TITLE_PAT.search(html)
-    if not m:
-        return None
+    if not m: return None
     raw = re.sub(r"\s+", " ", m.group(1)).strip()
     return RETAILERS[retailer]["title_clean"](raw)
 
-def check_identifier(q: str, retailer: str, timeout: int = 20):
+# ---------- Multi-candidate PDP extraction ----------
+def find_pdp_links(search_html: str, retailer: str, max_links: int = 5):
+    """Return up to max_links PDP candidate URLs (deduped, absolute)."""
+    pat = RETAILERS[retailer]["pdp_link_pat"]
+    base = RETAILERS[retailer]["base"]
+    seen = set()
+    out = []
+    for m in pat.finditer(search_html):
+        href = m.group(1) or m.group(2)
+        if not href: continue
+        url = urljoin(base, href)
+        if url not in seen:
+            seen.add(url)
+            out.append(url)
+        if len(out) >= max_links:
+            break
+    return out
+
+def maybe_append_ncni(url: str, retailer: str):
+    if retailer == "HomeDepot" and RETAILERS[retailer].get("append_ncni", False) and "NCNI-5" not in url:
+        return f"{url}{'&' if '?' in url else '?'}NCNI-5"
+    return url
+
+def check_identifier(q: str, retailer: str, timeout: int = 20, max_candidates: int = 5):
     s = make_session()
     try:
         # 1) Search page
         url_search = RETAILERS[retailer]["search"](q)
         r = s.get(url_search, timeout=timeout)
         search_html = r.text
-        # 2) Find first PDP link and fetch PDP
-        pdp = find_first_pdp(search_html, retailer)
-        if not pdp:
-            # Fall back to classifying the search page if no PDP link is found
+
+        # 2) Try up to N candidate PDP links
+        pdp_candidates = find_pdp_links(search_html, retailer, max_candidates)
+        if not pdp_candidates:
+            # fallback: classify search page
             return {
                 "Query": q, "Site": retailer,
-                "Status": classify_html(search_html),
+                "Status": classify_html_with_fallbacks(search_html),
                 "Product Name": clean_title(search_html, retailer),
                 "URL": r.url, "HTTP": r.status_code,
                 "Notes": "No PDP link found on search page",
             }
-        r2 = s.get(pdp, timeout=timeout)
-        pdp_html = r2.text
+
+        first_resp = None
+        for idx, pdp in enumerate(pdp_candidates, start=1):
+            pdp_url = maybe_append_ncni(pdp, retailer)
+            r2 = s.get(pdp_url, timeout=timeout)
+            if first_resp is None:
+                first_resp = (r2.url, r2.status_code, r2.text)
+            status = classify_html_with_fallbacks(r2.text)
+            # Take the first candidate that yields a definitive status (Live / OOS)
+            if status in ("Live / Available", "Found but Not Available"):
+                return {
+                    "Query": q, "Site": retailer,
+                    "Status": status,
+                    "Product Name": clean_title(r2.text, retailer),
+                    "URL": r2.url, "HTTP": r2.status_code,
+                    "Notes": f"Candidate {idx}/{len(pdp_candidates)}",
+                }
+
+        # If none were definitive, return the first PDP fetch as best-effort
+        if first_resp:
+            u, c, h = first_resp
+            return {
+                "Query": q, "Site": retailer,
+                "Status": classify_html_with_fallbacks(h),
+                "Product Name": clean_title(h, retailer),
+                "URL": u, "HTTP": c,
+                "Notes": "No definitive candidate; used first PDP",
+            }
+
+        # Fallback shouldn't be reached, but just in case:
         return {
             "Query": q, "Site": retailer,
-            "Status": classify_html(pdp_html),
-            "Product Name": clean_title(pdp_html, retailer),
-            "URL": r2.url, "HTTP": r2.status_code,
+            "Status": classify_html_with_fallbacks(search_html),
+            "Product Name": clean_title(search_html, retailer),
+            "URL": r.url, "HTTP": r.status_code,
+            "Notes": "No PDP candidates after parsing",
         }
+
     except Exception as e:
         return {
             "Query": q, "Site": retailer, "Status": "Error",
@@ -133,6 +241,10 @@ def check_identifier(q: str, retailer: str, timeout: int = 20):
         }
 
 # ---------- UI ----------
+with st.sidebar:
+    max_candidates = st.slider("PDP candidates to try", 1, 8, 5)
+    st.caption("If a site shows category tiles first, trying more candidates helps.")
+
 uploaded = st.file_uploader("Upload CSV/XLSX of SKUs (first column used)", type=["csv","xlsx","xls"])
 use_example = st.toggle("Use example SKUs (EZC17, EZC21, EZD17, EZD21, EZL17, EZL21)")
 
@@ -153,14 +265,13 @@ skus = df_in.iloc[:, 0].astype(str).str.strip().replace("", pd.NA).dropna().toli
 tabs = st.tabs(["HomeDepot.com","Lowes.com","TractorSupply.com"])
 for retailer, tab in zip(["HomeDepot","Lowes","TractorSupply"], tabs):
     with tab:
-        st.caption("Runs a search → follows the first product link → classifies on the product page.")
+        st.caption("Search → try first few PDP links → classify availability on PDP via JSON-LD/microdata.")
         if st.button(f"🔎 Check on {retailer}", key=f"btn_{retailer}"):
             rows = []
             prog = st.progress(0)
             for i, sku in enumerate(skus, start=1):
-                rows.append(check_identifier(sku, retailer))
+                rows.append(check_identifier(sku, retailer, max_candidates=max_candidates))
                 prog.progress(i / max(1, len(skus)))
                 st.dataframe(pd.DataFrame(rows), use_container_width=True)
             out = pd.DataFrame(rows)
             st.dataframe(out, use_container_width=True)
-
