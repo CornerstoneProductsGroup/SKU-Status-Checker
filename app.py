@@ -1,307 +1,47 @@
 import streamlit as st
 import pandas as pd
 import requests
+import time
 import re
-import json
-from html import unescape
-from urllib.parse import quote_plus, urljoin
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+from urllib.parse import quote_plus
+from io import BytesIO
 
 # =========================
-# App Config / Header
+# App config
 # =========================
-st.set_page_config(page_title="SKU Checker", page_icon="🛒", layout="wide")
-st.title("🛒 Multi-Retailer SKU Checker (Sync • PDP-accurate)")
+st.set_page_config(page_title="SKU Checker (API-powered)", page_icon="🛒", layout="wide")
+st.title("🛒 Multi-Retailer SKU Checker — API Mode (most accurate)")
 st.write(
-    "Upload a CSV/XLSX of SKUs (first column used). For each retailer, the app:\n"
-    "1) runs a search, 2) tries the first few product links, 3) classifies availability **on the product page** via JSON-LD/microdata, "
-    "with text fallbacks."
+    "This version calls **SerpApi** (Home Depot) and **Apify** (Lowe’s & Tractor Supply)**, "
+    "which run real browsers / structured parsers — far more accurate than raw HTML."
 )
 
-# =========================
-# HTTP Session (retries)
-# =========================
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Connection": "close",
-}
-
-def make_session():
-    s = requests.Session()
-    s.headers.update(HEADERS)
-    retry = Retry(
-        total=3,
-        backoff_factor=0.4,
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["GET", "HEAD", "OPTIONS"],
-        raise_on_status=False,
-    )
-    s.mount("https://", HTTPAdapter(max_retries=retry))
-    s.mount("http://", HTTPAdapter(max_retries=retry))
-    return s
-
-# =========================
-# Retailer Config & Regex
-# =========================
-TITLE_PAT = re.compile(r"<title>(.*?)</title>", re.S | re.I)
-
-AVAIL_LIVE = [
-    re.compile(r"Add\s*to\s*Cart", re.I),
-    re.compile(r"Ship\s*to\s*Home", re.I),
-    re.compile(r"Pickup\s*(at|in)\s*Store", re.I),
-    re.compile(r"In\s*Stock", re.I),
-    re.compile(r'aria-label="Add to Cart"', re.I),
-]
-AVAIL_NOT = [
-    re.compile(r"Out\s*of\s*Stock", re.I),
-    re.compile(r"Unavailable\s+at\s+this\s+time", re.I),
-    re.compile(r"This\s*item\s*is\s*unavailable", re.I),
-    re.compile(r"Not\s*Sold\s*in\s*Stores", re.I),
-    re.compile(r"Discontinued", re.I),
-    re.compile(r"Temporarily\s*Unavailable", re.I),
-]
-
-RETAILERS = {
-    "HomeDepot": {
-        "base": "https://www.homedepot.com",
-        "search": lambda q: f"https://www.homedepot.com/s/{quote_plus(q)}?searchTerm={quote_plus(q)}",
-        "pdp_link_pat": re.compile(r'href="(/p/[^"]+)"|href="(https?://www\.homedepot\.com/p/[^"]+)"', re.I),
-        "title_clean": lambda t: re.sub(r"\s*-?\s*The Home Depot.*$", "", t, flags=re.I),
-        "append_ncni": True,
-    },
-    "Lowes": {
-        "base": "https://www.lowes.com",
-        "search": lambda q: f"https://www.lowes.com/search?searchTerm={quote_plus(q)}",
-        "pdp_link_pat": re.compile(r'href="(/pd/[^"]+)"|href="(https?://www\.lowes\.com/pd/[^"]+)"', re.I),
-        "title_clean": lambda t: re.sub(r"\s*at\s*Lowes\.com.*$", "", t, flags=re.I),
-        "append_ncni": False,
-    },
-    "TractorSupply": {
-        "base": "https://www.tractorsupply.com",
-        "search": lambda q: f"https://www.tractorsupply.com/tsc/search/{quote_plus(q)}",
-        "pdp_link_pat": re.compile(r'href="(/tsc/product/[^"]+)"|href="(https?://www\.tractorsupply\.com/tsc/product/[^"]+)"', re.I),
-        "title_clean": lambda t: re.sub(r"\s*at\s*Tractor Supply.*$", "", t, flags=re.I),
-        "append_ncni": False,
-    },
-}
-
-# =========================
-# JSON-LD & Microdata Parsing
-# =========================
-AVAIL_MAP = {
-    "instock": "Live / Available",
-    "outofstock": "Found but Not Available",
-    "discontinued": "Found but Not Available",
-    "http://schema.org/instock": "Live / Available",
-    "https://schema.org/instock": "Live / Available",
-    "http://schema.org/outofstock": "Found but Not Available",
-    "https://schema.org/outofstock": "Found but Not Available",
-    "http://schema.org/discontinued": "Found but Not Available",
-    "https://schema.org/discontinued": "Found but Not Available",
-}
-
-LD_JSON_PAT = re.compile(r'<script[^>]+type="application/ld\+json"[^>]*>(.*?)</script>', re.S | re.I)
-MICRODATA_AVAIL_PAT = re.compile(r'itemprop=["\']availability["\'][^>]*href=["\']([^"\']+)["\']', re.I)
-PRICE_PAT = re.compile(r'"price"\s*:\s*"?\$?(\d[\d\.,]*)', re.I)
-
-def _normalize_availability(v: str | None):
-    if not v:
-        return None
-    v = v.strip().lower().replace("http://schema.org/", "").replace("https://schema.org/", "")
-    return AVAIL_MAP.get(v)
-
-def _walk_offers(obj):
-    if isinstance(obj, dict):
-        if "offers" in obj:
-            yield obj["offers"]
-        for key in ("aggregateOffer", "aggregateOffers"):
-            if key in obj:
-                yield obj[key]
-        for v in obj.values():
-            yield from _walk_offers(v)
-    elif isinstance(obj, list):
-        for it in obj:
-            yield from _walk_offers(it)
-
-def classify_via_jsonld(html: str):
-    for m in LD_JSON_PAT.finditer(html):
-        raw = unescape(m.group(1)).strip()
-        try:
-            data = json.loads(raw)
-        except Exception:
-            continue
-        for offers in _walk_offers(data):
-            if isinstance(offers, list):
-                for off in offers:
-                    status = _normalize_availability(str(off.get("availability", "")))
-                    if status:
-                        return status
-            elif isinstance(offers, dict):
-                status = _normalize_availability(str(offers.get("availability", "")))
-                if status:
-                    return status
-    return None
-
-def classify_via_microdata(html: str):
-    m = MICRODATA_AVAIL_PAT.search(html)
-    if not m:
-        return None
-    return _normalize_availability(m.group(1))
-
-def classify_html_with_fallbacks(html: str):
-    via_ld = classify_via_jsonld(html)
-    if via_ld:
-        return via_ld
-    via_micro = classify_via_microdata(html)
-    if via_micro:
-        return via_micro
-    if PRICE_PAT.search(html):
-        for rx in AVAIL_NOT:
-            if rx.search(html):
-                return "Found but Not Available"
-        return "Live / Available"
-    for rx in AVAIL_LIVE:
-        if rx.search(html):
-            return "Live / Available"
-    for rx in AVAIL_NOT:
-        if rx.search(html):
-            return "Found but Not Available"
-    return "No Results"
-
-def clean_title(html: str, retailer: str):
-    m = TITLE_PAT.search(html)
-    if not m:
-        return None
-    raw = re.sub(r"\s+", " ", m.group(1)).strip()
-    return RETAILERS[retailer]["title_clean"](raw)
-
-# =========================
-# PDP Links (multi-candidate)
-# =========================
-def find_pdp_links(search_html: str, retailer: str, max_links: int = 5):
-    pat = RETAILERS[retailer]["pdp_link_pat"]
-    base = RETAILERS[retailer]["base"]
-    seen = set()
-    out = []
-    for m in pat.finditer(search_html):
-        href = m.group(1) or m.group(2)
-        if not href:
-            continue
-        url = urljoin(base, href)
-        if url not in seen:
-            seen.add(url)
-            out.append(url)
-        if len(out) >= max_links:
-            break
-    return out
-
-def maybe_append_ncni(url: str, retailer: str):
-    if retailer == "HomeDepot" and RETAILERS[retailer].get("append_ncni", False) and "NCNI-5" not in url:
-        return f"{url}{'&' if '?' in url else '?'}NCNI-5"
-    return url
-
-def check_identifier(q: str, retailer: str, timeout: int = 20, max_candidates: int = 5):
-    s = make_session()
-    try:
-        url_search = RETAILERS[retailer]["search"](q)
-        r = s.get(url_search, timeout=timeout)
-        search_html = r.text
-
-        candidates = find_pdp_links(search_html, retailer, max_candidates)
-        if not candidates:
-            return {
-                "Query": q, "Site": retailer,
-                "Status": classify_html_with_fallbacks(search_html),
-                "Product Name": clean_title(search_html, retailer),
-                "URL": r.url, "HTTP": r.status_code,
-                "Notes": "No PDP link found on search page",
-            }
-
-        first_resp = None
-        for idx, pdp in enumerate(candidates, start=1):
-            pdp_url = maybe_append_ncni(pdp, retailer)
-            r2 = s.get(pdp_url, timeout=timeout)
-            if first_resp is None:
-                first_resp = (r2.url, r2.status_code, r2.text)
-            status = classify_html_with_fallbacks(r2.text)
-            if status in ("Live / Available", "Found but Not Available"):
-                return {
-                    "Query": q, "Site": retailer, "Status": status,
-                    "Product Name": clean_title(r2.text, retailer),
-                    "URL": r2.url, "HTTP": r2.status_code,
-                    "Notes": f"Candidate {idx}/{len(candidates)}",
-                }
-
-        if first_resp:
-            u, c, h = first_resp
-            return {
-                "Query": q, "Site": retailer,
-                "Status": classify_html_with_fallbacks(h),
-                "Product Name": clean_title(h, retailer),
-                "URL": u, "HTTP": c,
-                "Notes": "No definitive candidate; used first PDP",
-            }
-
-        return {
-            "Query": q, "Site": retailer,
-            "Status": classify_html_with_fallbacks(search_html),
-            "Product Name": clean_title(search_html, retailer),
-            "URL": r.url, "HTTP": r.status_code,
-            "Notes": "No PDP candidates after parsing",
-        }
-
-    except Exception as e:
-        return {
-            "Query": q, "Site": retailer,
-            "Status": "Error",
-            "Product Name": None,
-            "URL": None,
-            "HTTP": 0,
-            "Notes": str(e),
-        }
-
-# =========================
-# File Upload (robust)
-# =========================
 with st.sidebar:
-    max_candidates = st.slider("PDP candidates to try", 1, 8, 5)
-    st.caption("If search shows category tiles first, trying more candidates helps.")
+    st.header("API Keys")
+    serpapi_key = st.text_input("SerpApi key (Home Depot)", type="password")
+    apify_token = st.text_input("Apify token (Lowe’s & Tractor Supply)", type="password")
+    max_candidates = st.slider("PDP candidates to try (Apify)", 1, 5, 3)
+    st.caption("Apify will open the search page and try the first few product links.")
     st.markdown("---")
+    st.write("Upload a CSV/XLSX with SKUs in the **first column**.")
 
-uploaded = st.file_uploader(
-    "Upload CSV/XLSX of SKUs (first column used)",
-    type=["csv", "xlsx", "xls"]
-)
+# =========================
+# File upload (robust)
+# =========================
+uploaded = st.file_uploader("Upload CSV/XLSX", type=["csv", "xlsx"])
 use_example = st.toggle("Use example SKUs (EZC17, EZC21, EZD17, EZD21, EZL17, EZL21)")
 
 if not uploaded and not use_example:
-    st.info("Upload a file or toggle the example to proceed.")
     st.stop()
 
 try:
     if uploaded:
-        fname = uploaded.name.lower()
-        if fname.endswith(".csv"):
+        if uploaded.name.lower().endswith(".csv"):
             df_in = pd.read_csv(uploaded)
-        elif fname.endswith(".xlsx"):
-            try:
-                df_in = pd.read_excel(uploaded, engine="openpyxl")
-            except ImportError:
-                st.error("Excel support requires `openpyxl`. Add it to requirements.txt and redeploy.")
-                st.stop()
-        elif fname.endswith(".xls"):
-            st.error("Legacy .xls files aren’t supported. Save as .xlsx or CSV instead.")
-            st.stop()
         else:
-            st.error("Unsupported file type. Please upload CSV or XLSX.")
-            st.stop()
+            # needs openpyxl pinned in requirements
+            import openpyxl  # noqa: F401
+            df_in = pd.read_excel(uploaded, engine="openpyxl")
     else:
         df_in = pd.DataFrame({"SKU": ["EZC17","EZC21","EZD17","EZD21","EZL17","EZL21"]})
 except Exception as e:
@@ -310,45 +50,370 @@ except Exception as e:
 
 first_col = df_in.columns[0]
 skus = (
-    df_in[first_col]
-    .astype(str)
-    .str.strip()
-    .replace("", pd.NA)
-    .dropna()
-    .tolist()
+    df_in[first_col].astype(str).str.strip().replace("", pd.NA).dropna().tolist()
 )
 
 # =========================
-# UI per retailer + Export
+# Helpers
 # =========================
-def to_excel_bytes(df: pd.DataFrame) -> bytes:
-    from io import BytesIO
+def to_excel_bytes(df: pd.DataFrame, filename="Results") -> bytes:
     bio = BytesIO()
     with pd.ExcelWriter(bio, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="Results")
+        df.to_excel(writer, index=False, sheet_name=filename)
     return bio.getvalue()
 
-tabs = st.tabs(["HomeDepot.com", "Lowes.com", "TractorSupply.com"])
-for retailer, tab in zip(["HomeDepot", "Lowes", "TractorSupply"], tabs):
-    with tab:
-        st.caption("Search → try first few PDP links → classify availability on PDP via JSON-LD/microdata (fallback: text).")
-        run = st.button(f"🔎 Check on {retailer}", key=f"btn_{retailer}")
-        if run:
+def norm_status(val: str | None):
+    if not val:
+        return None
+    v = str(val).strip().lower()
+    if v in ("instock", "in stock", "available", "live", "yes", "true"):
+        return "Live / Available"
+    if v in ("outofstock", "out of stock", "unavailable", "discontinued", "no", "false"):
+        return "Found but Not Available"
+    return None
+
+# =========================
+# Home Depot via SerpApi
+# =========================
+# Docs: https://serpapi.com/home-depot-search-api  + Product API
+# Typical call: GET https://serpapi.com/search.json?engine=home_depot&q=<query>&delivery_zip=<zip>&api_key=<key>
+HD_SEARCH = "https://serpapi.com/search.json"
+def hd_via_serpapi(query: str, api_key: str, delivery_zip: str | None = None):
+    params = {
+        "engine": "home_depot",
+        "q": query,
+        "api_key": api_key,
+    }
+    if delivery_zip:
+        params["delivery_zip"] = delivery_zip
+    r = requests.get(HD_SEARCH, params=params, timeout=40)
+    r.raise_for_status()
+    data = r.json()
+
+    # SerpApi returns 'products' for Home Depot Search API.
+    # We'll take the first product that looks like a PDP.
+    products = data.get("products") or []
+    if not products:
+        # some responses use 'organic_results'
+        products = data.get("organic_results") or []
+
+    # Pull a reasonable fieldset
+    if products:
+        p = products[0]
+        title = p.get("title")
+        link = p.get("link") or p.get("product_link") or p.get("url")
+        price = p.get("price") or p.get("price_str")
+        availability = p.get("availability") or p.get("availability_status")
+        status = norm_status(availability)
+
+        # If availability missing but price exists, assume Live (typical for SerpApi)
+        if not status and price:
+            status = "Live / Available"
+
+        return {
+            "Query": query,
+            "Site": "HomeDepot",
+            "Status": status or "No Results",
+            "Product Name": title,
+            "URL": link,
+            "Price": price,
+            "HTTP": 200,
+            "Notes": "SerpApi Home Depot Search",
+        }
+    else:
+        return {
+            "Query": query,
+            "Site": "HomeDepot",
+            "Status": "No Results",
+            "Product Name": None,
+            "URL": None,
+            "Price": None,
+            "HTTP": 200,
+            "Notes": "No products in SerpApi response",
+        }
+
+# =========================
+# Apify (generic Web Scraper) for Lowe’s & Tractor Supply
+# =========================
+# We feed the retailer search URL + a pageFunction that:
+#  - Clicks or selects the first few product result links
+#  - Loads each PDP and extracts availability from JSON-LD/microdata/text
+APIFY_ACTOR = "apify/web-scraper"
+APIFY_RUN_URL = "https://api.apify.com/v2/acts/{actor}/runs"
+APIFY_GET_RUN = "https://api.apify.com/v2/actor-tasks/{id}"  # not used here
+APIFY_GET_ITEMS = "https://api.apify.com/v2/datasets/{dataset_id}/items?clean=true"
+
+def apify_run_search(actor: str, token: str, start_url: str, max_candidates: int = 3):
+    """
+    Start an Apify web-scraper run for a retailer search URL.
+    Returns (dataset_id, run_id).
+    """
+    # The pageFunction extracts links and then navigates to PDPs; returns a single best status.
+    page_function = f"""
+    async function pageFunction(context) {{
+      const {{ request, log, page, $, response, crawler }} = context;
+      const url = request.url;
+
+      // helper to sleep
+      const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+      function normAvailability(str) {{
+        if (!str) return null;
+        const v = String(str).toLowerCase().trim();
+        if (/(instock|in stock|available|add to cart|ship to home)/.test(v)) return "Live / Available";
+        if (/(outofstock|out of stock|unavailable|discontinued|temporarily unavailable)/.test(v)) return "Found but Not Available";
+        return null;
+      }}
+
+      // parse JSON-LD availability
+      async function availabilityFromJSONLD() {{
+        try {{
+          const handles = await page.$$eval('script[type="application/ld+json"]', els => els.map(e => e.textContent));
+          for (const raw of handles) {{
+            try {{
+              const data = JSON.parse(raw);
+              const arr = Array.isArray(data) ? data : [data];
+              for (const obj of arr) {{
+                let offers = obj.offers || obj.aggregateOffer || obj.aggregateOffers;
+                if (offers) {{
+                  const list = Array.isArray(offers) ? offers : [offers];
+                  for (const off of list) {{
+                    const av = (off && off.availability) || "";
+                    const short = String(av).toLowerCase().replace("https://schema.org/","").replace("http://schema.org/","");
+                    const n = normAvailability(short);
+                    if (n) return n;
+                  }}
+                }}
+              }}
+            }} catch(e) {{}}
+          }}
+        }} catch(e) {{}}
+        return null;
+      }}
+
+      async function availabilityFromMicrodata() {{
+        try {{
+          const href = await page.$eval('[itemprop="availability"]', el => el.getAttribute('href'));
+          if (href) {{
+            const short = href.toLowerCase().replace("https://schema.org/","").replace("http://schema.org/","");
+            const n = normAvailability(short);
+            if (n) return n;
+          }}
+        }} catch(e) {{}}
+        return null;
+      }}
+
+      async function availabilityFromText() {{
+        const html = await page.content();
+        const lower = html.toLowerCase();
+        if (/(add\\s*to\\s*cart|in\\s*stock|ship\\s*to\\s*home)/.test(lower)) return "Live / Available";
+        if (/(out\\s*of\\s*stock|unavailable|discontinued|temporarily\\s*unavailable)/.test(lower)) return "Found but Not Available";
+        return null;
+      }}
+
+      async function classifyPDP(pdpUrl) {{
+        try {{
+          await page.goto(pdpUrl, {{ waitUntil: 'domcontentloaded', timeout: 45000 }});
+          await sleep(1500);
+
+          let stat = await availabilityFromJSONLD();
+          if (!stat) stat = await availabilityFromMicrodata();
+          if (!stat) stat = await availabilityFromText();
+
+          const title = await page.title();
+          return {{ status: stat || "No Results", url: page.url(), title }};
+        }} catch (e) {{
+          return {{ status: "Error", url: pdpUrl, title: null, note: String(e) }};
+        }}
+      }}
+
+      // If this is a search page, collect first few product links and test them.
+      const isLowes = /lowes\\.com/.test(url);
+      const isTsc = /tractorsupply\\.com/.test(url);
+
+      let productLinks = [];
+      if (isLowes) {{
+        // Lowe's search: product anchors usually like /pd/... or have data-products
+        const anchors = await page.$$eval('a[href*="/pd/"]', as => as.map(a => a.href));
+        productLinks = [...new Set(anchors)].slice(0, {max_candidates});
+      }} else if (isTsc) {{
+        const anchors = await page.$$eval('a[href*="/tsc/product/"]', as => as.map(a => a.href));
+        productLinks = [...new Set(anchors)].slice(0, {max_candidates});
+      }}
+
+      const results = [];
+      for (const link of productLinks) {{
+        const r = await classifyPDP(link);
+        results.push(r);
+        if (r.status === "Live / Available" || r.status === "Found but Not Available") break;
+      }}
+
+      if (results.length === 0) {{
+        // Maybe we're already on a PDP (if user pasted PDP URL)
+        const self = await classifyPDP(url);
+        results.push(self);
+      }}
+
+      // push best result
+      const best = results[0];
+      await context.pushData(best);
+    }}
+    """
+
+    payload = {
+        "startUrls": [{"url": start_url}],
+        "pageFunction": page_function,
+        "maxConcurrency": 2,
+        "initialCookies": [],
+        "ignoreSslErrors": True,
+        "useChrome": True,
+        "proxyConfiguration": {"useApifyProxy": True},
+    }
+
+    res = requests.post(
+        APIFY_RUN_URL.format(actor=actor),
+        params={"token": token, "waitForFinish": 60},  # wait some seconds for fast runs
+        json=payload,
+        timeout=90,
+    )
+    res.raise_for_status()
+    run = res.json().get("data", {})
+    dataset_id = (run.get("defaultDatasetId") or run.get("datasetId"))
+    run_id = run.get("id")
+    return dataset_id, run_id
+
+def apify_fetch_items(dataset_id: str, token: str):
+    url = APIFY_GET_ITEMS.format(dataset_id=dataset_id)
+    r = requests.get(url, params={"token": token}, timeout=60)
+    r.raise_for_status()
+    return r.json()
+
+def lowes_via_apify(query: str, token: str, max_candidates: int = 3):
+    search_url = f"https://www.lowes.com/search?searchTerm={quote_plus(query)}"
+    ds, _ = apify_run_search(APIFY_ACTOR, token, search_url, max_candidates=max_candidates)
+    items = apify_fetch_items(ds, token)
+    if not items:
+        return {
+            "Query": query, "Site": "Lowes",
+            "Status": "No Results", "Product Name": None,
+            "URL": None, "HTTP": 200, "Notes": "Apify returned no items"
+        }
+    it = items[0]
+    status = it.get("status")
+    title = it.get("title")
+    url = it.get("url")
+    return {
+        "Query": query, "Site": "Lowes",
+        "Status": status or "No Results",
+        "Product Name": title, "URL": url, "HTTP": 200,
+        "Notes": f"Apify Web Scraper (candidates ≤ {max_candidates})"
+    }
+
+def tsc_via_apify(query: str, token: str, max_candidates: int = 3):
+    search_url = f"https://www.tractorsupply.com/tsc/search/{quote_plus(query)}"
+    ds, _ = apify_run_search(APIFY_ACTOR, token, search_url, max_candidates=max_candidates)
+    items = apify_fetch_items(ds, token)
+    if not items:
+        return {
+            "Query": query, "Site": "TractorSupply",
+            "Status": "No Results", "Product Name": None,
+            "URL": None, "HTTP": 200, "Notes": "Apify returned no items"
+        }
+    it = items[0]
+    status = it.get("status")
+    title = it.get("title")
+    url = it.get("url")
+    return {
+        "Query": query, "Site": "TractorSupply",
+        "Status": status or "No Results",
+        "Product Name": title, "URL": url, "HTTP": 200,
+        "Notes": f"Apify Web Scraper (candidates ≤ {max_candidates})"
+    }
+
+# =========================
+# UI: Tabs per retailer
+# =========================
+tab_hd, tab_lowes, tab_tsc = st.tabs(["HomeDepot.com (SerpApi)", "Lowes.com (Apify)", "TractorSupply.com (Apify)"])
+
+with tab_hd:
+    st.caption("Uses SerpApi Home Depot API for structured results.")
+    if not serpapi_key:
+        st.warning("Add your **SerpApi key** in the sidebar to enable Home Depot checks.")
+    else:
+        if st.button("🔎 Check Home Depot"):
             rows = []
             prog = st.progress(0)
             for i, sku in enumerate(skus, start=1):
-                rows.append(check_identifier(sku, retailer, max_candidates=max_candidates))
+                try:
+                    rows.append(hd_via_serpapi(sku, serpapi_key))
+                except Exception as e:
+                    rows.append({
+                        "Query": sku, "Site": "HomeDepot", "Status": "Error",
+                        "Product Name": None, "URL": None, "HTTP": 0, "Notes": str(e)
+                    })
                 prog.progress(i / max(1, len(skus)))
                 st.dataframe(pd.DataFrame(rows), use_container_width=True)
             out = pd.DataFrame(rows)
             st.dataframe(out, use_container_width=True)
-
-            xls = to_excel_bytes(out)
             st.download_button(
-                "📥 Download Excel Results",
-                data=xls,
-                file_name=f"{retailer.lower()}_sku_status.xlsx",
+                "📥 Download Excel (Home Depot)",
+                data=to_excel_bytes(out, "HomeDepot"),
+                file_name="homedepot_status.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
 
-st.caption("Tip: If you see false 'No Results', increase 'PDP candidates to try' in the sidebar.")
+with tab_lowes:
+    st.caption("Uses Apify Web Scraper (headless browser) for on-page availability.")
+    if not apify_token:
+        st.warning("Add your **Apify token** in the sidebar to enable Lowe’s checks.")
+    else:
+        if st.button("🔎 Check Lowe’s"):
+            rows = []
+            prog = st.progress(0)
+            for i, sku in enumerate(skus, start=1):
+                try:
+                    rows.append(lowes_via_apify(sku, apify_token, max_candidates=max_candidates))
+                except Exception as e:
+                    rows.append({
+                        "Query": sku, "Site": "Lowes", "Status": "Error",
+                        "Product Name": None, "URL": None, "HTTP": 0, "Notes": str(e)
+                    })
+                prog.progress(i / max(1, len(skus)))
+                st.dataframe(pd.DataFrame(rows), use_container_width=True)
+            out = pd.DataFrame(rows)
+            st.dataframe(out, use_container_width=True)
+            st.download_button(
+                "📥 Download Excel (Lowe’s)",
+                data=to_excel_bytes(out, "Lowes"),
+                file_name="lowes_status.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+
+with tab_tsc:
+    st.caption("Uses Apify Web Scraper (headless browser) for on-page availability.")
+    if not apify_token:
+        st.warning("Add your **Apify token** in the sidebar to enable Tractor Supply checks.")
+    else:
+        if st.button("🔎 Check Tractor Supply"):
+            rows = []
+            prog = st.progress(0)
+            for i, sku in enumerate(skus, start=1):
+                try:
+                    rows.append(tsc_via_apify(sku, apify_token, max_candidates=max_candidates))
+                except Exception as e:
+                    rows.append({
+                        "Query": sku, "Site": "TractorSupply", "Status": "Error",
+                        "Product Name": None, "URL": None, "HTTP": 0, "Notes": str(e)
+                    })
+                prog.progress(i / max(1, len(skus)))
+                st.dataframe(pd.DataFrame(rows), use_container_width=True)
+            out = pd.DataFrame(rows)
+            st.dataframe(out, use_container_width=True)
+            st.download_button(
+                "📥 Download Excel (Tractor Supply)",
+                data=to_excel_bytes(out, "TractorSupply"),
+                file_name="tractorsupply_status.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+
+st.caption("Tip: API mode is the most accurate because it uses a full browser (Apify) or structured retail API (SerpApi).")
