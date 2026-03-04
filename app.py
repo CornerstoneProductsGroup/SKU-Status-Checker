@@ -211,21 +211,49 @@ uploaded_map = st.file_uploader("Upload SKU Map.xlsx (or keep default if running
 DEFAULT_MAP_PATH = "SKU Map.xlsx"  # put next to app.py in repo/zip
 
 def load_depot_map(file) -> pd.DataFrame:
-    if file is not None:
-        df = pd.read_excel(file, sheet_name="Depot")
-    else:
-        df = pd.read_excel(DEFAULT_MAP_PATH, sheet_name="Depot")
-    # normalize columns
+    """
+    Loads the Depot tab from the Excel map.
+
+    Some hosting environments (notably certain Python 3.13 builds) may fail to install openpyxl.
+    To keep the app running, we fall back to a bundled CSV export of the Depot tab.
+    """
     expected = ["OMSID", "Internet #", "SKU #", "UPC", "GTIN", "Vendor"]
-    missing = [c for c in expected if c not in df.columns]
-    if missing:
-        raise RuntimeError(f"Depot sheet missing columns: {missing}. Found columns: {list(df.columns)}")
-    # clean
-    df = df.copy()
-    for c in ["OMSID", "Internet #", "SKU #", "UPC", "GTIN"]:
-        df[c] = df[c].apply(_as_int_str)
-    df["Vendor"] = df["Vendor"].astype(str).str.strip()
-    return df
+
+    def _validate(df: pd.DataFrame) -> pd.DataFrame:
+        missing = [c for c in expected if c not in df.columns]
+        if missing:
+            raise RuntimeError(f"Depot data missing columns: {missing}. Found columns: {list(df.columns)}")
+        df = df.copy()
+        for c in ["OMSID", "Internet #", "SKU #", "UPC", "GTIN"]:
+            df[c] = df[c].apply(_as_int_str)
+        df["Vendor"] = df["Vendor"].astype(str).str.strip()
+        return df
+
+    # If user uploaded a file, try Excel, then CSV.
+    if file is not None:
+        try:
+            df = pd.read_excel(file, sheet_name="Depot")
+            return _validate(df)
+        except Exception as e:
+            try:
+                file.seek(0)
+                df = pd.read_csv(file)
+                return _validate(df)
+            except Exception:
+                raise RuntimeError(
+                    "Could not read the uploaded map. If this environment can't install openpyxl, "
+                    "upload a CSV export of the Depot sheet instead. Original error: "
+                    f"{e}"
+                )
+
+    # No upload: try bundled Excel first, then bundled CSV fallback.
+    try:
+        df = pd.read_excel(DEFAULT_MAP_PATH, sheet_name="Depot")
+        return _validate(df)
+    except Exception:
+        df = pd.read_csv("SKU Map - Depot.csv")
+        return _validate(df)
+
 
 try:
     depot_map = load_depot_map(uploaded_map)

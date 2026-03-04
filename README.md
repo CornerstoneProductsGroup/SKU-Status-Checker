@@ -33,3 +33,9 @@ streamlit run app.py
 ## Notes
 - Availability is location-dependent; enter a ZIP for better signals.
 - This app uses caching to reduce API calls. Clear cache if needed in Streamlit menu.
+
+
+## CSV fallback (if openpyxl won't install)
+- This zip includes `SKU Map - Depot.csv`.
+- If your host can't install `openpyxl` (common on some Python 3.13 images), the app will automatically use the CSV.
+- You can also upload your own CSV export of the Depot sheet.
