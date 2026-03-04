@@ -1,6 +1,0 @@
-streamlit
-pandas
-openpyxl
-requests
-beautifulsoup4
-lxml
